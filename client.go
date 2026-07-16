@@ -64,9 +64,20 @@ func newRateLimiter(perSec int) *rateLimiter {
 	return rl
 }
 
-func (rl *rateLimiter) wait() {
-	if rl != nil {
-		<-rl.tokens
+// allow reports (without blocking) whether one more rate-limited action may proceed.
+// It gates only speculative download prefetches, so a spent budget just means fewer
+// prefetches this round — it never blocks connection setup, control ops, or the
+// in-order writer. That's the difference from a blocking limiter, which starved new
+// connections under load.
+func (rl *rateLimiter) allow() bool {
+	if rl == nil {
+		return true
+	}
+	select {
+	case <-rl.tokens:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -103,7 +114,6 @@ func newXport(base string, insecure bool, serverName string, maxConns, poolSize,
 
 // dial opens one fresh TCP+TLS connection (handshake done, no request yet).
 func (x *xport) dial(timeout time.Duration) (*tls.Conn, error) {
-	x.rl.wait() // pace new connections so sustained load stays under the escalation threshold
 	raw, err := net.DialTimeout("tcp", x.host, timeout)
 	if err != nil {
 		return nil, err
@@ -366,8 +376,14 @@ func (t *tunnel) downPump() {
 		nextWrite++
 		atomic.StoreInt64(&t.nextW, int64(nextWrite))
 		stuckSince = time.Now()
-		// Prefetch already-produced chunks within the window (never blocks).
+		// Prefetch already-produced chunks within the window (never blocks). Each
+		// speculative prefetch is gated by the rate limiter: when the per-second budget
+		// is spent, we simply prefetch fewer chunks this round, which steadies sustained
+		// throughput below the escalation threshold without ever stalling the writer.
 		for i := nextWrite + 1; i <= nextWrite+t.workers && i < prod; i++ {
+			if !t.x.rl.allow() {
+				break
+			}
 			prefetch(i)
 		}
 	}
