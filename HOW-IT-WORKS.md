@@ -63,6 +63,36 @@ Two measurements pin the mechanism:
 Constraint: **~16 KB per TCP connection to a denylisted SNI, enforced by silent drop,
 keyed on cleartext SNI, with IP reputation as a coarse pre-filter.**
 
+### Why this doesn't break the Russian internet
+
+An obvious objection: if every connection dies after 16 KB, how does anything work?
+How do Russians bank, stream, run businesses?
+
+Because the quota is **not global**. It's a targeted instrument, triggered
+selectively by one or more of:
+
+- a **denylisted SNI** (VPN/circumvention/blocked hostnames),
+- a **suspicious IP** (datacenter and known-VPN ranges — see the measured raw-TCP
+  result in §2: even a no-SNI connection to a VPS IP got throttled), and/or
+- a recognizable **protocol fingerprint** (WireGuard's fixed handshake, etc.).
+
+The overwhelming majority of traffic matches none of these. Domestic Russian sites,
+banks, government services, Yandex, VK, and the big whitelisted global CDNs
+(Google, Cloudflare, Fastly, Apple) run at **full line speed** — no quota. That's the
+country's working internet.
+
+They *have* to leave it that way. A blanket 16 KB-per-connection cap would break every
+website, every mobile app, every payment terminal, every business — and their own
+state services. The economy runs on those connections. So the throttle can only ever
+be a scalpel aimed at traffic that *looks* like circumvention, never a blanket cap.
+
+That necessity is exactly the seam cyclevpn exploits. To slip through you need traffic
+that (1) reveals no denylisted SNI, (2) rides an acceptable-looking TLS/CDN shape,
+(3) doesn't match a known tunnel-protocol fingerprint, and (4) keeps each connection
+under the quota. cyclevpn's transport is a stream of ordinary-looking short HTTPS
+requests, which satisfies all four. The enforcement primitive — a per-connection byte
+quota — **resets on every new connection**, and that reset is the whole game.
+
 ---
 
 ## 2. Why standard circumvention tools fail
@@ -82,10 +112,48 @@ bulk over a single connection that hits the 16 KB wall. What we tested:
 | **Domain fronting** | SNI = a big CDN name, `Host:` = your backend on the same CDN. Cloudflare returns 403 on cross-tenant fronting; it's been disabled. |
 | **Platform hosting** (`*.workers.dev`, `*.pages.dev`, `*.run.app`, `*.vercel.app`, `*.fly.dev`, `*.deno.dev`) | All throttled: the platform apex names are denylisted or the pattern is flagged. |
 | **Point traffic at a real whitelisted host** (speed.cloudflare.com etc.) | You don't control those servers, so you can't terminate a tunnel on them. The fast SNI is unusable as an endpoint. |
+| **WireGuard / Tailscale / OpenVPN** | One tunnel = one flow. WireGuard is a single UDP flow (bulk UDP is dropped across the border — measured below); Tailscale's DERP fallback is a single TLS connection (per-connection quota). See the measured results below. |
 | **Commercial VPNs** | Endpoint IP ranges are known and blocked/throttled at the IP layer. |
 
 The common thread: the quota is per-connection, and none of these break bulk traffic
 into enough separate connections. cyclevpn is the piece that does exactly that.
+
+### Measured: WireGuard and Tailscale from Russia
+
+We ran the tests rather than assume. All measured RU box (176.113.82.126) → foreign
+box (Contabo 169.58.27.100), across the real border:
+
+| Test | Result | Reading |
+|---|---|---|
+| WireGuard **handshake** (small packets) | completes, 50 ms RTT, 0% ping loss | tiny packets are under quota, so the tunnel *forms* |
+| WireGuard **bulk** (iperf3 through tunnel) | connection times out, ~0 throughput | the tunnel carries no real traffic |
+| Raw **UDP** flood, 100 Mbit target | sender pushed 90 Mbit/s, **receiver got 0 bytes** | bulk UDP is dropped wholesale in transit |
+| Raw **TCP**, no TLS/SNI | ~1 Mbit/s for ~1 s, then socket killed | even without an SNI, the datacenter IP is throttled |
+| **cyclevpn** (many short conns, same IP) | 7.1 Mbit/s sustained | per-connection quota resets per connection |
+
+What this establishes:
+
+- **WireGuard direct = dead for bulk.** The handshake and keepalives (small) pass, so
+  the tunnel looks up — but the moment it carries a real transfer the UDP flow is
+  dropped. The raw-UDP row is the proof: 90 Mbit sent, **zero received**.
+- **Tailscale direct mode is WireGuard**, so it inherits that result: unusable.
+- **Tailscale relay mode (DERP)** is a single long-lived TLS connection to a Tailscale
+  relay — one connection carrying everything — which is exactly the single-connection
+  case the ~16 KB quota kills. Dead too.
+- **Tailscale feasibility verdict: non-viable, both modes.** It isn't cleanly
+  *blocked* (control/handshake traffic connects), but there is no usable bulk path.
+  A full end-to-end Tailscale login (needs an interactive browser auth) would only
+  re-confirm a transport verdict already settled by the WireGuard and single-TLS
+  measurements.
+- The raw-TCP row adds a nuance to §1: throttling is **not purely SNI-based** — a
+  datacenter/VPS IP is penalized even with no SNI at all. But note the last row:
+  cyclevpn gets **7.1 Mbit/s to the very same IP** that kills a single TCP stream at
+  ~1 Mbit/s. That's the entire thesis in one comparison — the quota is per-connection,
+  so many small connections beat one big one even against a reputation-flagged IP.
+
+The general rule this confirms: **any design with one persistent tunnel loses; only
+spreading bulk across many sub-quota connections wins.** WireGuard, Tailscale,
+OpenVPN, plain VLESS/REALITY all build one tunnel. cyclevpn refuses to.
 
 ---
 
@@ -307,17 +375,28 @@ retried (§13).
 Video also buffers seconds ahead, absorbing the timing jitter from cycling, so
 playback stays smooth on bursty delivery.
 
-Real-time calls are the exception, and it's structural, not tunable:
+Real-time calls (WhatsApp, Telegram, FaceTime) are the exception, and it's structural,
+not tunable. Two independent reasons:
 
-- Calls are UDP. There's no reliable stream to slice.
-- Calls are latency-bound: a packet late by >150 ms is useless, and the app would
-  rather drop it than wait. Cycling adds latency and guarantees delivery by retrying —
-  the opposite trade. Buffering, which saves video, is unavailable to a live
-  conversation.
+- **The transport is TCP-only.** cyclevpn's SOCKS5 server implements `CONNECT` only
+  (client.go, `handleSocks` rejects any command that isn't `0x01`). It does not
+  implement `UDP ASSOCIATE`. Call *media* is UDP, so it cannot traverse the tunnel at
+  all — only the call's TCP *signaling* does. That's the exact signature of "the call
+  connects, then drops": signaling sets it up over TCP, then the UDP media has nowhere
+  to go.
+- **Even if we tunneled the UDP, cycling is the wrong trade for a call.** A voice
+  packet late by >150 ms is useless, and the app would rather drop it than wait.
+  Cycling *adds* latency and *guarantees* delivery by retrying — the opposite of what a
+  call wants. Buffering, which rescues video, is impossible for a live conversation.
 
-So split-tunnel: send call apps straight out, route browsing/streaming/messaging/
-downloads through the VPN. Chat messages (small TCP requests) pass fine; only live
-call media should bypass.
+**Fix — split-tunnel the call apps.** In Shadowrocket (or v2rayNG/NekoBox) add a rule
+that routes the call app **DIRECT**, bypassing the proxy, so its UDP media uses the
+phone's real network. Messages still go through the VPN (they're small TCP requests and
+work fine); only the live call bypasses. If the phone's own network also degrades that
+app's calls, no tunnel can fix that — the call never had a working UDP path to begin
+with. Note: we can't inspect a call to debug it — call media is end-to-end encrypted
+and never appears in the entry/exit logs (the tunnel refuses its UDP before it starts);
+the diagnosis is structural, not log-based.
 
 ---
 
