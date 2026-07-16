@@ -9,6 +9,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -301,21 +302,41 @@ func (x *xport) udpOpen() (string, error) {
 	return string(b), nil
 }
 
-// once does a single request on one fresh connection with NO retry. For voice, a
-// stalled connection must be abandoned fast rather than retried slowly: a re-tried
-// request is what produces multi-second latency tails. Abandoning a return long-poll
-// loses no data (the relay holds the datagrams for the next poll); abandoning a send
-// drops at most one datagram, which voice tolerates.
+// once does one request tuned for real-time UDP. It retries only on a *fast* connection
+// error — a pooled connection the throttle silently killed fails in milliseconds, and
+// skipping past it (with a fresh dial) is what keeps voice working on a churned box. It
+// does NOT retry on a *timeout*: a request that ran the full deadline is abandoned,
+// because retrying a slow request is what produces multi-second latency tails (a return
+// long-poll loses no data when abandoned — the relay holds the datagrams; a send drops
+// at most one datagram, which voice conceals).
 func (x *xport) once(method, path string, body []byte, timeout time.Duration) (int, []byte, error) {
 	x.sem <- struct{}{}
 	defer func() { <-x.sem }()
-	c, err := x.getConn(timeout)
-	if err != nil {
-		return 0, nil, err
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		var c *tls.Conn
+		var err error
+		if attempt == 0 {
+			c, err = x.getConn(timeout) // try a pre-warmed connection first
+		} else {
+			c, err = x.dial(timeout) // pooled one was dead — dial fresh
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		start := time.Now()
+		st, _, b, err := x.roundtrip(c, method, path, body, timeout)
+		c.Close()
+		if err == nil {
+			return st, b, nil
+		}
+		lastErr = err
+		if time.Since(start) >= timeout { // genuine timeout, not a dead connection — don't chase it
+			break
+		}
 	}
-	st, _, b, err := x.roundtrip(c, method, path, body, timeout)
-	c.Close()
-	return st, b, err
+	return 0, nil, lastErr
 }
 
 func (x *xport) udpSend(sid string, frames []byte) { x.once("POST", "/u/s?s="+sid, frames, udpSendTO) }

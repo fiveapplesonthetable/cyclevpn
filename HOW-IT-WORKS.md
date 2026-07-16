@@ -392,11 +392,14 @@ make it work as a real-time path rather than a slow one:
   retries for throughput; the UDP path does the opposite. Outgoing datagrams are
   coalesced for only ~30 ms then sent; the return direction keeps a few short long-polls
   always waiting so a datagram is delivered ~½ RTT after it lands.
-- **Fail fast, never retry (`xport.once`).** A retried request is what creates
-  multi-second latency tails. For voice, a stalled connection is abandoned in ~350 ms
-  and re-fired on a fresh one. Abandoning a *return* poll loses **no data** — the relay
-  holds the datagrams for the next poll — and abandoning a *send* drops at most one
-  datagram, which voice conceals. This is why the tail stays flat.
+- **Retry on connection-error, not on timeout (`xport.once`).** This split is the
+  crux. A *timed-out* request is abandoned, never chased — retrying a slow request is
+  what creates multi-second latency tails (abandoning a return poll loses **no data**;
+  the relay holds the datagrams for the next poll). But a *connection error* — a
+  pooled connection the throttle silently killed, which fails in milliseconds — is
+  retried immediately on a fresh dial. Skipping past dead pooled connections is what
+  keeps voice working on a churned box; without it, a single dead connection in the
+  pool drops the request (an early version failed exactly this way under load).
 
 **Measured** (RU → exit, 50 pps voice-rate UDP through the tunnel to an echo server):
 
