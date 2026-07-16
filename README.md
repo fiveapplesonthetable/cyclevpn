@@ -192,9 +192,25 @@ connections), `-maxconns` (global connection cap), `-chunk` (bytes/request, keep
 < ~16 KB), `-fetch-timeout` / `-poll-timeout` / `-ctrl-timeout`.
 **relay:** `-chunk`, `-hold` (long-poll wait).
 
-**Important — more is NOT always better.** Opening connections *too* aggressively
-(very large `-workers`/`-pool` sustained) can make the firewall **escalate** its
-throttling and clamp the whole box, collapsing throughput. Sweep upward and back
-off once you see it degrade. A moderate config (e.g. `-workers 32 -pool 64
--maxconns 96`) is a good starting point; push it up only as far as your route
-tolerates. The client uses only ~15–30 MB RAM even with a large pool.
+**Important — more is NOT always better, and you cannot benchmark your way
+higher.** Throughput is bounded by *(bytes allowed per connection ≈ 16 KB) ×
+(rate you can open connections)*. The chunk size is already near the quota, so the
+only lever is connection rate — but opening connections *too* aggressively makes
+the firewall **escalate** its throttling and clamp the whole box.
+
+Measured on the 1-CPU RuVDS entry box: on a **rested** box the moderate default
+`-workers 32 -pool 96 -maxconns 128 -fetch-timeout 1500ms` did **7.1 Mbit/s at
+20/20 reliability**. Raising `-workers` to 48 or 64 did **not** help (≈2.5 Mbit/s);
+a shorter `-fetch-timeout` (900 ms) **hurt** (1.6 Mbit/s). And crucially, a
+back-to-back saturated benchmark sweep **collapsed the same config from 7.1 to
+0.6 Mbit/s** — because the sweep itself is the connection churn that triggers the
+escalation. It recovers after the box sits idle for a while.
+
+Takeaways: the moderate default is the sweet spot; the ceiling is route-imposed,
+not config-imposed; and **sustained full-saturation traffic self-throttles** —
+normal bursty browsing (with idle gaps) stays fast, continuous max-rate downloads
+degrade. The client uses only ~15–30 MB RAM even with a large pool.
+
+If a `cyclevpn client` service ever returns dead connections (`000`) while a
+freshly launched client works, the long-lived instance has wedged its pool —
+`systemctl restart cyccli` clears it.
