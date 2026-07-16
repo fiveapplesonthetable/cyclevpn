@@ -222,6 +222,11 @@ not config-imposed; and **sustained full-saturation traffic self-throttles** —
 normal bursty browsing (with idle gaps) stays fast, continuous max-rate downloads
 degrade. The client uses only ~15–30 MB RAM even with a large pool.
 
-If a `cyclevpn client` service ever returns dead connections (`000`) while a
-freshly launched client works, the long-lived instance has wedged its pool —
-`systemctl restart cyccli` clears it.
+**Pool self-healing.** An earlier version could *wedge*: the warmers pre-open
+connections, the throttle silently kills idle ones, and if a request retried onto
+another (also-dead) pooled connection, a pool full of dead connections made every
+request return `000` until the service was restarted (a freshly launched client
+worked because its pool was empty). Fixed — `do()` now dials a **fresh** connection
+on retry, so a poisoned pool drains itself instead of wedging. If you ever still see
+persistent `000`s, `systemctl restart cyccli` is the manual fallback, but it should
+no longer be necessary.

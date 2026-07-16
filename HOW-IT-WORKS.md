@@ -483,8 +483,16 @@ the first they're cheap. This is the main reason one CPU suffices.
 (client.go:91) dial and handshake connections ahead of time and park them in a channel
 (`-pool`, default 96). `getConn` (client.go:109) takes a ready one with no handshake on
 the request path. The pool also absorbs the throttle's random connection drops: a
-failed dial is retried in the background (client.go:98), so the data path only sees
-healthy connections.
+failed dial is retried (with a short backoff) in the background, so the data path only
+sees handshake-completed connections.
+
+**Pool self-healing.** A parked connection can still be silently killed by the throttle
+while it waits. If a request lands on such a dead connection, `do()` **retries by
+dialing a fresh connection, not by grabbing another pooled one** (client.go). This
+matters: an earlier version retried onto another pooled connection, so once the pool
+filled with dead connections *every* request failed until the service was restarted (a
+freshly launched client worked because its pool was empty). Dialing fresh on retry lets
+a poisoned pool drain itself. The same principle is in the UDP path's `once` (§10).
 
 **One request per connection** (`c.Close()`, client.go:130; HTTP/1.1 `Connection:
 close`). A second request would push the connection past the quota into the drop zone,
@@ -527,8 +535,18 @@ open connections too fast, sustained, and TSPU penalizes the whole box, dropping
 larger fraction of new connections, which lowers the effective rate.
 
 Measured: a rested box did 7.1 Mbit/s on the default config; a back-to-back saturated
-benchmark drove the same config to 0.6 Mbit/s because the benchmark's own churn tripped
-escalation. The measurement perturbs the system.
+benchmark drove the same config to 0.6 Mbit/s. The measurement perturbs the system.
+
+A caution learned the hard way: not every slowdown is "the throttle escalating." When a
+box is hammered, several things happen at once and are easy to conflate. Verified with
+`nstat`/`ss`/`dmesg` on the entry box: (1) the throttle's silent packet-drop is real
+and measured (`TCPLostRetransmit`, `TCPTimeouts` counters climb) and genuinely lowers
+peak throughput; but (2) a *total* failure — every request returning `000` — was **not**
+the throttle, it was the pool-wedge bug above (fixed); and (3) during peak churn the box
+briefly hit `tcp_max_orphans` (default 2048 — low), logging `TCP: too many orphaned
+sockets`, a local effect that self-clears in a minute or two. So attribute a slowdown to
+throttle escalation only after ruling out a wedged pool and local socket exhaustion —
+measure, don't assume.
 
 Operating point: moderate parallelism, and let natural gaps in usage keep the box out
 of the penalty state. Bursty browsing stays fast; a continuous max-rate download is the
