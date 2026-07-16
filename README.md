@@ -7,6 +7,10 @@ under the quota, so full‑speed traffic is reassembled from many cheap connecti
 It is a two‑hop design so you can use a **standard phone app** (Shadowrocket /
 v2rayNG / NekoBox) with no custom client on the phone.
 
+> This README is the **deployment** guide. For the mechanism — how Russia detects and
+> throttles, why standard tools fail against it, and how the slicing works down to the
+> packet and kernel level — see **[HOW-IT-WORKS.md](HOW-IT-WORKS.md)**.
+
 ---
 
 ## The problem this solves
