@@ -38,6 +38,36 @@ type xport struct {
 	tlsCfg  *tls.Config
 	pool    chan *tls.Conn // pre-warmed, handshake-done, unused connections
 	sem     chan struct{}  // global cap on concurrent in-flight requests
+	rl      *rateLimiter   // paces NEW connections/sec so sustained load doesn't trip escalation
+}
+
+// rateLimiter paces new connection dials to at most perSec. The throttle's escalation
+// is triggered by how FAST a box opens connections, not how many at once — so capping
+// the open-RATE lets sustained traffic (video) run steadily under the trip threshold.
+type rateLimiter struct{ tokens chan struct{} }
+
+func newRateLimiter(perSec int) *rateLimiter {
+	if perSec <= 0 {
+		return nil // unlimited
+	}
+	rl := &rateLimiter{tokens: make(chan struct{}, perSec)}
+	go func() {
+		t := time.NewTicker(time.Second / time.Duration(perSec))
+		defer t.Stop()
+		for range t.C {
+			select {
+			case rl.tokens <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return rl
+}
+
+func (rl *rateLimiter) wait() {
+	if rl != nil {
+		<-rl.tokens
+	}
 }
 
 // newXport pre-warms a bounded POOL of TLS connections to the relay. Each
@@ -45,7 +75,7 @@ type xport struct {
 // quota) and is then discarded. A background warmer keeps the pool full and
 // silently absorbs the fraction of connections the throttle drops, so the
 // request path only ever grabs a healthy, handshake-already-done connection.
-func newXport(base string, insecure bool, serverName string, maxConns, poolSize int) *xport {
+func newXport(base string, insecure bool, serverName string, maxConns, poolSize, rate int) *xport {
 	base = strings.TrimRight(base, "/")
 	hostHdr := strings.SplitN(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/", 2)[0]
 	host := hostHdr
@@ -63,6 +93,7 @@ func newXport(base string, insecure bool, serverName string, maxConns, poolSize 
 		},
 		pool: make(chan *tls.Conn, poolSize),
 		sem:  make(chan struct{}, maxConns),
+		rl:   newRateLimiter(rate),
 	}
 	for i := 0; i < poolSize/8+1; i++ {
 		go x.warm()
@@ -72,6 +103,7 @@ func newXport(base string, insecure bool, serverName string, maxConns, poolSize 
 
 // dial opens one fresh TCP+TLS connection (handshake done, no request yet).
 func (x *xport) dial(timeout time.Duration) (*tls.Conn, error) {
+	x.rl.wait() // pace new connections so sustained load stays under the escalation threshold
 	raw, err := net.DialTimeout("tcp", x.host, timeout)
 	if err != nil {
 		return nil, err
@@ -408,6 +440,7 @@ func runClient(args []string) {
 	workers := fs.Int("workers", 16, "download prefetch window per stream")
 	maxConns := fs.Int("maxconns", 96, "global cap on concurrent connections (all streams)")
 	poolSize := fs.Int("pool", 64, "pre-warmed connection pool size (memory vs latency tradeoff)")
+	rate := fs.Int("rate", 0, "max NEW connections/sec (0=unlimited; lower it to stop sustained video tripping escalation)")
 	chunk := fs.Int("chunk", CHUNK, "bytes per request (must stay under the ~16KB per-connection quota)")
 	ctrlTO := fs.Duration("ctrl-timeout", ctrlTimeout, "timeout for open/upload/close")
 	fetchTO := fs.Duration("fetch-timeout", fetchTimeout, "timeout for prefetch of a produced chunk")
@@ -436,7 +469,7 @@ func runClient(args []string) {
 	debug = *dbg
 	CHUNK, ctrlTimeout, fetchTimeout, pollTimeout = *chunk, *ctrlTO, *fetchTO, *pollTO
 	udpBatchWindow, udpPollers, udpBlockQUIC = *ubatch, *upollers, *blockQUIC
-	x := newXport(*url, *insecure, *sni, *maxConns, *poolSize)
+	x := newXport(*url, *insecure, *sni, *maxConns, *poolSize, *rate)
 	if st, _, _, err := x.do("GET", "/t/ping", nil, ctrlTimeout); err != nil || st != 200 {
 		log.Fatalf("relay unreachable at %s: st=%d err=%v", *url, st, err)
 	}
