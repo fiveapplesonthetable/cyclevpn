@@ -486,9 +486,17 @@ func runClient(args []string) {
 	CHUNK, ctrlTimeout, fetchTimeout, pollTimeout = *chunk, *ctrlTO, *fetchTO, *pollTO
 	udpBatchWindow, udpPollers, udpBlockQUIC = *ubatch, *upollers, *blockQUIC
 	x := newXport(*url, *insecure, *sni, *maxConns, *poolSize, *rate)
-	if st, _, _, err := x.do("GET", "/t/ping", nil, ctrlTimeout); err != nil || st != 200 {
-		log.Fatalf("relay unreachable at %s: st=%d err=%v", *url, st, err)
-	}
+	// Startup reachability check runs in the background and is never fatal: bind and
+	// accept immediately so connections work the instant the path recovers, instead of
+	// the service blocking (or crash-looping) through a bad throttle window and never
+	// listening.
+	go func() {
+		if st, _, _, err := x.do("GET", "/t/ping", nil, ctrlTimeout); err != nil || st != 200 {
+			log.Printf("warning: relay not reachable yet at %s (st=%d err=%v) — will serve as soon as it is", *url, st, err)
+		} else {
+			log.Printf("relay reachable: %s", *url)
+		}
+	}()
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatal(err)
