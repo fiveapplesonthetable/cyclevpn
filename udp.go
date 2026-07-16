@@ -28,6 +28,7 @@ var (
 	udpPollers     = 3                      // client: concurrent return-direction long-polls kept in flight
 	udpSendTO      = 400 * time.Millisecond // client: timeout for an upstream send (fail fast; a late voice packet is useless)
 	udpRecvTO      = 350 * time.Millisecond // client: timeout for a return long-poll (must exceed udpHold; abandoning loses no data)
+	udpBlockQUIC   = true                   // client: drop UDP :443 (QUIC) so video/web falls back to the TCP path
 )
 
 // ---- datagram framing: atyp(1) | addr | port(2 BE) | len(2 BE) | payload, repeated ----
@@ -458,6 +459,16 @@ func handleUDPAssociate(ctrl net.Conn, x *xport) {
 				log.Printf("udp send: first app packet from %s, %d bytes", src, n)
 			}
 			if atyp, addr, port, payload, ok := parseSocksUDP(buf[:n]); ok {
+				// QUIC (HTTP/3, UDP :443) is high-bandwidth and belongs on the TCP path,
+				// not this latency-first voice path. Dropping it makes browsers/YouTube
+				// fall back to TCP, which the cycling transport streams well. Voice apps
+				// use other UDP ports and are unaffected.
+				if udpBlockQUIC && port == 443 {
+					if debug {
+						log.Printf("udp: dropped QUIC (:443) -> forces TCP fallback")
+					}
+					continue
+				}
 				batch = appendFrame(batch, atyp, addr, port, payload)
 				if start.IsZero() {
 					start = time.Now()

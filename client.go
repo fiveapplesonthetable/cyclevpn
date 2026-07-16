@@ -416,6 +416,7 @@ func runClient(args []string) {
 	sni := fs.String("sni", "", "TLS server name (default: host from -url)")
 	ubatch := fs.Duration("ubatch", udpBatchWindow, "UDP: coalesce outgoing datagrams for this long per send")
 	upollers := fs.Int("upollers", udpPollers, "UDP: concurrent return-direction long-polls per association")
+	blockQUIC := fs.Bool("block-quic", udpBlockQUIC, "UDP: drop QUIC (:443) so video/web uses the TCP path")
 	dbg := fs.Bool("debug", false, "log per-stream failures")
 	fs.Parse(args)
 
@@ -434,7 +435,7 @@ func runClient(args []string) {
 	}
 	debug = *dbg
 	CHUNK, ctrlTimeout, fetchTimeout, pollTimeout = *chunk, *ctrlTO, *fetchTO, *pollTO
-	udpBatchWindow, udpPollers = *ubatch, *upollers
+	udpBatchWindow, udpPollers, udpBlockQUIC = *ubatch, *upollers, *blockQUIC
 	x := newXport(*url, *insecure, *sni, *maxConns, *poolSize)
 	if st, _, _, err := x.do("GET", "/t/ping", nil, ctrlTimeout); err != nil || st != 200 {
 		log.Fatalf("relay unreachable at %s: st=%d err=%v", *url, st, err)
