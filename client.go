@@ -96,7 +96,8 @@ func (x *xport) warm() {
 		}
 		c, err := x.dial(4 * time.Second)
 		if err != nil {
-			continue // dropped by the throttle — just try again, the request path never sees it
+			time.Sleep(50 * time.Millisecond) // dropped by the throttle — back off so we don't hammer the path
+			continue
 		}
 		select {
 		case x.pool <- c:
@@ -120,8 +121,17 @@ func (x *xport) do(method, path string, body []byte, timeout time.Duration) (int
 	x.sem <- struct{}{}
 	defer func() { <-x.sem }()
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		c, err := x.getConn(timeout)
+	for attempt := 0; attempt < 3; attempt++ {
+		var c *tls.Conn
+		var err error
+		if attempt == 0 {
+			c, err = x.getConn(timeout) // a pre-warmed connection first (cheap)
+		} else {
+			// The pooled connection was stale/dead — dial FRESH. Grabbing another pooled
+			// connection (which may also be dead) is what let a throttle-poisoned pool
+			// wedge the whole client until a restart.
+			c, err = x.dial(timeout)
+		}
 		if err != nil {
 			lastErr = err
 			continue
@@ -131,7 +141,7 @@ func (x *xport) do(method, path string, body []byte, timeout time.Duration) (int
 		if err == nil {
 			return st, hdr, b, nil
 		}
-		lastErr = err // pooled conn may have gone stale — retry once with a fresh dial
+		lastErr = err
 	}
 	return 0, nil, nil, lastErr
 }
