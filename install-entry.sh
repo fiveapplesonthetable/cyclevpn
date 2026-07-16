@@ -36,7 +36,7 @@ Description=cyclevpn cycling client
 After=network-online.target
 Wants=network-online.target
 [Service]
-ExecStart=/usr/local/bin/cyclevpn client -url https://${EXIT_DOMAIN} -listen 127.0.0.1:10900 -workers 24
+ExecStart=/usr/local/bin/cyclevpn client -url https://${EXIT_DOMAIN} -listen 127.0.0.1:10900 -workers 32 -maxconns 128 -pool 96 -fetch-timeout 1500ms
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
