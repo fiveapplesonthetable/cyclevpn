@@ -48,6 +48,9 @@ ${DOMAIN} {
 	handle /t/* {
 		reverse_proxy 127.0.0.1:8791
 	}
+	handle /u/* {
+		reverse_proxy 127.0.0.1:8791
+	}
 	handle {
 		respond "ok" 200
 	}

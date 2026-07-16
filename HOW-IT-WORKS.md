@@ -375,28 +375,54 @@ retried (§13).
 Video also buffers seconds ahead, absorbing the timing jitter from cycling, so
 playback stays smooth on bursty delivery.
 
-Real-time calls (WhatsApp, Telegram, FaceTime) are the exception, and it's structural,
-not tunable. Two independent reasons:
+### Voice calls (UDP)
 
-- **The transport is TCP-only.** cyclevpn's SOCKS5 server implements `CONNECT` only
-  (client.go, `handleSocks` rejects any command that isn't `0x01`). It does not
-  implement `UDP ASSOCIATE`. Call *media* is UDP, so it cannot traverse the tunnel at
-  all — only the call's TCP *signaling* does. That's the exact signature of "the call
-  connects, then drops": signaling sets it up over TCP, then the UDP media has nowhere
-  to go.
-- **Even if we tunneled the UDP, cycling is the wrong trade for a call.** A voice
-  packet late by >150 ms is useless, and the app would rather drop it than wait.
-  Cycling *adds* latency and *guarantees* delivery by retrying — the opposite of what a
-  call wants. Buffering, which rescues video, is impossible for a live conversation.
+Real-time calls are UDP, and the naive expectation is that they can't work: a call's
+UDP flow is a single flow, and we measured (§2) that a single UDP flow across the
+border dies at the ~32 KB quota — for a voice call at ~3–4 KB/s that's ~8 seconds, then
+silence. That is exactly the "call connects, works a few seconds, drops" symptom. And
+going **direct** doesn't fix it, because Russia throttles the call servers the same way.
 
-**Fix — split-tunnel the call apps.** In Shadowrocket (or v2rayNG/NekoBox) add a rule
-that routes the call app **DIRECT**, bypassing the proxy, so its UDP media uses the
-phone's real network. Messages still go through the VPN (they're small TCP requests and
-work fine); only the live call bypasses. If the phone's own network also degrades that
-app's calls, no tunnel can fix that — the call never had a working UDP path to begin
-with. Note: we can't inspect a call to debug it — call media is end-to-end encrypted
-and never appears in the entry/exit logs (the tunnel refuses its UDP before it starts);
-the diagnosis is structural, not log-based.
+But the fix is the same principle as the rest of this document: **spread the call over
+many sub-quota connections instead of one flow.** cyclevpn carries UDP (`udp.go`), and
+because a voice call is *low-bitrate*, it cycles comfortably under the quota. Two things
+make it work as a real-time path rather than a slow one:
+
+- **Latency-first transport, not throughput-first.** The download path (§7) buffers and
+  retries for throughput; the UDP path does the opposite. Outgoing datagrams are
+  coalesced for only ~30 ms then sent; the return direction keeps a few short long-polls
+  always waiting so a datagram is delivered ~½ RTT after it lands.
+- **Fail fast, never retry (`xport.once`).** A retried request is what creates
+  multi-second latency tails. For voice, a stalled connection is abandoned in ~350 ms
+  and re-fired on a fresh one. Abandoning a *return* poll loses **no data** — the relay
+  holds the datagrams for the next poll — and abandoning a *send* drops at most one
+  datagram, which voice conceals. This is why the tail stays flat.
+
+**Measured** (RU → exit, 50 pps voice-rate UDP through the tunnel to an echo server):
+
+| Duration | Loss | RTT avg | RTT p99 | RTT max |
+|---|---|---|---|---|
+| 60 s (rested box) | **0.1%** | 79 ms | 114 ms | 183 ms |
+| 120 s | 3.6% | 81 ms | 146 ms | 340 ms |
+| video-rate (400 kbit/s) | ~7% | 83 ms | 134 ms | 206 ms |
+
+Voice is call-quality: median RTT ~80 ms, jitter (p99−p50) ~30 ms, and it **survives
+past the quota** where a single flow would have died at 8 s. As with everything here,
+quality tracks box health — a box degraded by heavy churn shows higher loss (15%+),
+same escalation as §13. **Video calls are marginal** (higher bitrate → more churn →
+~7%+ loss); voice is the reliable target.
+
+No configuration is needed — the client answers SOCKS5 `UDP ASSOCIATE` automatically, so
+a phone that routes UDP through the tunnel (VLESS carries it) just works. Tunables:
+`-ubatch` (send coalescing window), `-upollers` (return long-polls in flight), relay
+`-uhold` (return long-poll hold).
+
+Internals: the client's `handleUDPAssociate` opens a local UDP socket, tunnels each
+datagram to a relay UDP session (`POST /u/s`), and streams replies back
+(`GET /u/r`, short-hold long-poll). The relay session (`udpSession`) holds one
+unconnected UDP socket, sends to the datagram's destination (resolving domains at the
+exit), and buffers replies tagged with their source for the client to drain. Endpoints:
+`/u/o` open, `/u/s` send, `/u/r` receive, `/u/c` close.
 
 ---
 

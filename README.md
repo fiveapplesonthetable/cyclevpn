@@ -149,12 +149,17 @@ download that takes minutes) stay alive because **the real connection lives on t
 exit box and is never cycled** — only the invisible entry↔exit transport is made
 of short connections. The app’s connection can stay open for hours.
 
-**Real-time calls (WhatsApp/voice/video) are the exception.** They are UDP and
-extremely latency-sensitive. This tunnel carries **TCP** (browsing, video,
-messaging, downloads) and the connection-cycling adds latency that is fine for
-streaming (buffered) but too much for a live call. Recommendation: **split-tunnel**
-call apps (send them straight out, not through the VPN); route everything else
-through cyclevpn.
+**Voice calls (WhatsApp/Telegram) work** via a dedicated UDP path (SOCKS5 `UDP
+ASSOCIATE`, tuned for latency not throughput). Measured through the tunnel at
+voice bitrate: ~80 ms median RTT, p99 ~115 ms, ~0.1% loss on a rested box — call
+quality, and it survives past the throttle where a single UDP flow would die in
+~8 s. No config needed; a phone that routes UDP through the tunnel just works.
+See **[HOW-IT-WORKS.md](HOW-IT-WORKS.md)** §10.
+
+**Video calls are marginal** (higher bitrate → more connection churn → ~7%+ loss);
+voice is the reliable target. If a call app misbehaves you can still **split-tunnel**
+it (route it DIRECT), but note direct calls are often throttled in Russia too, which
+is why carrying them through the tunnel is worthwhile.
 
 ## How it works internally
 
@@ -194,7 +199,9 @@ Every knob is a flag so you can sweep for your box/route:
 **client:** `-workers` (download prefetch window per stream), `-pool` (pre-warmed
 connections), `-maxconns` (global connection cap), `-chunk` (bytes/request, keep
 < ~16 KB), `-fetch-timeout` / `-poll-timeout` / `-ctrl-timeout`.
-**relay:** `-chunk`, `-hold` (long-poll wait).
+**client (UDP/voice):** `-ubatch` (outgoing datagram coalescing window),
+`-upollers` (return long-polls kept in flight per call).
+**relay:** `-chunk`, `-hold` (TCP long-poll wait), `-uhold` (UDP return long-poll wait).
 
 **Important — more is NOT always better, and you cannot benchmark your way
 higher.** Throughput is bounded by *(bytes allowed per connection ≈ 16 KB) ×

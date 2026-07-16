@@ -342,8 +342,8 @@ func handleSocks(c net.Conn, x *xport, workers int) {
 	io.ReadFull(c, methods)
 	c.Write([]byte{5, 0}) // no auth
 	hdr := make([]byte, 4)
-	if _, err := io.ReadFull(c, hdr); err != nil || hdr[1] != 1 {
-		c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
+	if _, err := io.ReadFull(c, hdr); err != nil || (hdr[1] != 1 && hdr[1] != 3) {
+		c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0}) // only CONNECT(1) and UDP ASSOCIATE(3)
 		return
 	}
 	var host string
@@ -369,6 +369,11 @@ func handleSocks(c net.Conn, x *xport, workers int) {
 	io.ReadFull(c, pb)
 	port := int(binary.BigEndian.Uint16(pb))
 	c.SetDeadline(time.Time{})
+
+	if hdr[1] == 3 { // UDP ASSOCIATE: the parsed host/port are the app's advertised source (ignored)
+		handleUDPAssociate(c, x)
+		return
+	}
 
 	sid, err := x.open(host, port)
 	if err != nil {
@@ -399,6 +404,8 @@ func runClient(args []string) {
 	pollTO := fs.Duration("poll-timeout", pollTimeout, "timeout for the long-poll of the needed chunk")
 	insecure := fs.Bool("insecure", false, "skip TLS cert verification")
 	sni := fs.String("sni", "", "TLS server name (default: host from -url)")
+	ubatch := fs.Duration("ubatch", udpBatchWindow, "UDP: coalesce outgoing datagrams for this long per send")
+	upollers := fs.Int("upollers", udpPollers, "UDP: concurrent return-direction long-polls per association")
 	dbg := fs.Bool("debug", false, "log per-stream failures")
 	fs.Parse(args)
 
@@ -417,6 +424,7 @@ func runClient(args []string) {
 	}
 	debug = *dbg
 	CHUNK, ctrlTimeout, fetchTimeout, pollTimeout = *chunk, *ctrlTO, *fetchTO, *pollTO
+	udpBatchWindow, udpPollers = *ubatch, *upollers
 	x := newXport(*url, *insecure, *sni, *maxConns, *poolSize)
 	if st, _, _, err := x.do("GET", "/t/ping", nil, ctrlTimeout); err != nil || st != 200 {
 		log.Fatalf("relay unreachable at %s: st=%d err=%v", *url, st, err)

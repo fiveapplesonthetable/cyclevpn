@@ -155,6 +155,9 @@ func (s *session) close() { s.conn.Close() }
 type relay struct {
 	mu   sync.Mutex
 	sess map[string]*session
+
+	umu   sync.Mutex
+	usess map[string]*udpSession
 }
 
 func (r *relay) reap() {
@@ -169,6 +172,14 @@ func (r *relay) reap() {
 			}
 		}
 		r.mu.Unlock()
+		r.umu.Lock()
+		for k, u := range r.usess {
+			if now-u.last > 120 {
+				u.close()
+				delete(r.usess, k)
+			}
+		}
+		r.umu.Unlock()
 	}
 }
 
@@ -265,6 +276,8 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprintf(w, "produced=%d downEOF=%v downBuf=%d upNext=%d upEnd=%d upBuf=%d", prod, eof, dn, un, ue, ub)
 	case "/t/ping":
 		w.Write([]byte("pong"))
+	case "/u/o", "/u/s", "/u/r", "/u/c":
+		r.serveUDP(w, req)
 	default:
 		http.Error(w, "?", 404)
 	}
@@ -277,9 +290,10 @@ func runRelay(args []string) {
 	listen := fs.String("listen", "127.0.0.1:8791", "listen address (put a TLS reverse proxy in front)")
 	chunk := fs.Int("chunk", CHUNK, "bytes per chunk (match the client)")
 	hold := fs.Duration("hold", holdTime, "how long a long-poll waits for the next chunk")
+	uhold := fs.Duration("uhold", udpHold, "how long a UDP return long-poll waits before returning empty")
 	fs.Parse(args)
-	CHUNK, holdTime = *chunk, *hold
-	r := &relay{sess: map[string]*session{}}
+	CHUNK, holdTime, udpHold = *chunk, *hold, *uhold
+	r := &relay{sess: map[string]*session{}, usess: map[string]*udpSession{}}
 	go r.reap()
 	srv := &http.Server{Addr: *listen, Handler: r}
 	log.Printf("cyclevpn relay on %s", *listen)
