@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -28,12 +29,13 @@ type session struct {
 	upMu   sync.Mutex
 	upNext int
 	upBuf  map[int][]byte
+	upEnd  int // seq at which the client half-closed its write side (-1 = open)
 
 	last int64
 }
 
 func newSession(c net.Conn) *session {
-	s := &session{conn: c, down: map[int][]byte{}, upBuf: map[int][]byte{}, last: time.Now().Unix()}
+	s := &session{conn: c, down: map[int][]byte{}, upBuf: map[int][]byte{}, upEnd: -1, last: time.Now().Unix()}
 	go s.reader()
 	return s
 }
@@ -60,10 +62,11 @@ func (s *session) reader() {
 	s.conn.Close()
 }
 
-// readDown returns chunk i (blocking until produced or EOF), dropping any chunk
-// below ack (the client has already written those). Empty+!eof => client retries.
-func (s *session) readDown(i, ack int) (data []byte, eof bool) {
-	deadline := time.Now().Add(15 * time.Second)
+// readDown returns chunk i (blocking until produced or EOF), the current produced
+// count, and eof. Drops any chunk below ack (already written by the client).
+// Returns empty+!eof only if the wait deadline expires (client retries).
+func (s *session) readDown(i, ack int) (data []byte, eof bool, prod int) {
+	deadline := time.Now().Add(holdTime)
 	for {
 		s.mu.Lock()
 		for k := range s.down {
@@ -71,29 +74,49 @@ func (s *session) readDown(i, ack int) (data []byte, eof bool) {
 				delete(s.down, k)
 			}
 		}
+		prod = s.produced
 		if b, ok := s.down[i]; ok {
 			e := s.downEOF && i+1 >= s.produced
 			s.last = time.Now().Unix()
 			s.mu.Unlock()
-			return b, e
+			return b, e, prod
 		}
 		if s.downEOF {
 			s.mu.Unlock()
-			return nil, true
+			return nil, true, prod
 		}
 		s.last = time.Now().Unix()
 		s.mu.Unlock()
 		if time.Now().After(deadline) {
-			return nil, false
+			return nil, false, prod
 		}
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// peekDown returns chunk i if it is already produced, without blocking.
+func (s *session) peekDown(i, ack int) (data []byte, eof bool, prod int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.down {
+		if k < ack {
+			delete(s.down, k)
+		}
+	}
+	s.last = time.Now().Unix()
+	prod = s.produced
+	if b, ok := s.down[i]; ok {
+		return b, s.downEOF && i+1 >= s.produced, prod
+	}
+	return nil, s.downEOF, prod
 }
 
 func (s *session) writeUp(i int, data []byte) {
 	s.upMu.Lock()
 	defer s.upMu.Unlock()
-	s.upBuf[i] = data
+	if i >= s.upNext { // ignore duplicates from lost-ACK retries
+		s.upBuf[i] = data
+	}
 	for {
 		d, ok := s.upBuf[s.upNext]
 		if !ok {
@@ -105,7 +128,26 @@ func (s *session) writeUp(i int, data []byte) {
 		delete(s.upBuf, s.upNext)
 		s.upNext++
 	}
+	s.maybeCloseWriteLocked()
 	s.last = time.Now().Unix()
+}
+
+// endUp records that the client half-closed after seq `end`; once all upstream
+// chunks are written, the target's write side is closed (proper TCP half-close).
+func (s *session) endUp(end int) {
+	s.upMu.Lock()
+	defer s.upMu.Unlock()
+	s.upEnd = end
+	s.maybeCloseWriteLocked()
+	s.last = time.Now().Unix()
+}
+
+func (s *session) maybeCloseWriteLocked() {
+	if s.upEnd >= 0 && s.upNext >= s.upEnd {
+		if tc, ok := s.conn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}
 }
 
 func (s *session) close() { s.conn.Close() }
@@ -163,8 +205,18 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		i, _ := strconv.Atoi(q.Get("i"))
-		body, _ := io.ReadAll(io.LimitReader(req.Body, CHUNK*2))
+		body, _ := io.ReadAll(io.LimitReader(req.Body, int64(CHUNK*2)))
 		s.writeUp(i, body)
+		w.Write([]byte("ok"))
+	case "/t/e":
+		q := req.URL.Query()
+		s := r.get(q.Get("s"))
+		if s == nil {
+			http.Error(w, "gone", 410)
+			return
+		}
+		i, _ := strconv.Atoi(q.Get("i"))
+		s.endUp(i)
 		w.Write([]byte("ok"))
 	case "/t/d":
 		q := req.URL.Query()
@@ -175,7 +227,16 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		i, _ := strconv.Atoi(q.Get("i"))
 		ack, _ := strconv.Atoi(q.Get("a"))
-		data, eof := s.readDown(i, ack)
+		wait := q.Get("w") == "1"
+		var data []byte
+		var eof bool
+		var prod int
+		if wait {
+			data, eof, prod = s.readDown(i, ack) // long-poll: only for the needed chunk
+		} else {
+			data, eof, prod = s.peekDown(i, ack) // instant: for prefetching produced chunks
+		}
+		w.Header().Set("X-Prod", strconv.Itoa(prod))
 		if eof {
 			w.Header().Set("X-Eof", "1")
 		}
@@ -189,6 +250,19 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		r.mu.Unlock()
 		w.Write([]byte("ok"))
+	case "/t/stat":
+		s := r.get(req.URL.Query().Get("s"))
+		if s == nil {
+			http.Error(w, "gone", 410)
+			return
+		}
+		s.mu.Lock()
+		prod, eof, dn := s.produced, s.downEOF, len(s.down)
+		s.mu.Unlock()
+		s.upMu.Lock()
+		un, ue, ub := s.upNext, s.upEnd, len(s.upBuf)
+		s.upMu.Unlock()
+		fmt.Fprintf(w, "produced=%d downEOF=%v downBuf=%d upNext=%d upEnd=%d upBuf=%d", prod, eof, dn, un, ue, ub)
 	case "/t/ping":
 		w.Write([]byte("pong"))
 	default:
@@ -196,10 +270,15 @@ func (r *relay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+var holdTime = 4 * time.Second
+
 func runRelay(args []string) {
 	fs := flag.NewFlagSet("relay", flag.ExitOnError)
 	listen := fs.String("listen", "127.0.0.1:8791", "listen address (put a TLS reverse proxy in front)")
+	chunk := fs.Int("chunk", CHUNK, "bytes per chunk (match the client)")
+	hold := fs.Duration("hold", holdTime, "how long a long-poll waits for the next chunk")
 	fs.Parse(args)
+	CHUNK, holdTime = *chunk, *hold
 	r := &relay{sess: map[string]*session{}}
 	go r.reap()
 	srv := &http.Server{Addr: *listen, Handler: r}

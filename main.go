@@ -12,7 +12,7 @@ import (
 	"os"
 )
 
-const CHUNK = 14000 // bytes per request — safely under the ~16KB per-connection quota
+var CHUNK = 14000 // payload per request; must stay under the ~16KB per-connection quota
 
 func main() {
 	if len(os.Args) < 2 {

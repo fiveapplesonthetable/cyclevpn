@@ -108,6 +108,50 @@ change (it only references the entry box).
 
 ---
 
+## How can this carry a big download, or a video stream, or a call?
+
+This is the part that seems impossible at first: if the firewall kills every
+connection after ~16 KB, how do you download a 100 MB file or watch YouTube?
+
+The trick is that **the stream your app sees and the connections on the wire are
+two different things.**
+
+* On the **exit** box, `cyclevpn` opens **one normal, long-lived TCP connection**
+  to the real destination (say `youtube.com`) and keeps it open. From YouTube's
+  point of view there is a single, continuous connection — it never sees any
+  cycling. The exit reads that stream and chops it into numbered ~14 KB chunks:
+  `0, 1, 2, 3, …`, buffering them.
+* On the **entry** box (in Russia), the client pulls those chunks over **many
+  separate short HTTPS connections** — connection A grabs chunk 0, connection B
+  grabs chunk 1, C grabs chunk 2, all at the same time. Each connection carries
+  only its one chunk (well under the 16 KB quota), so the firewall lets it
+  through at full speed, then the connection is thrown away. There are always
+  fresh ones being opened.
+* The client reassembles the chunks back into order (`0,1,2,3,…`) and hands your
+  app a **single, continuous TCP stream** — exactly what it sent on the exit side.
+
+So a 100 MB download is really ~7,000 chunks pulled over ~7,000 short-lived
+connections (opened and discarded continuously, dozens in flight at once) and
+glued back into one file. Your browser just sees a normal download.
+
+**Throughput** = (chunks in flight in parallel) × 16 KB ÷ (time per connection).
+With ~16–24 parallel connections that is several Mbit/s from a 1‑CPU box — enough
+for browsing and **SD/HD video**. More parallel connections (a bigger entry box)
+= more speed. Video also **buffers**, which smooths over the small variations as
+connections cycle, so playback stays steady.
+
+**Long-lived / persistent connections** (a chat socket, a streaming video, a
+download that takes minutes) stay alive because **the real connection lives on the
+exit box and is never cycled** — only the invisible entry↔exit transport is made
+of short connections. The app’s connection can stay open for hours.
+
+**Real-time calls (WhatsApp/voice/video) are the exception.** They are UDP and
+extremely latency-sensitive. This tunnel carries **TCP** (browsing, video,
+messaging, downloads) and the connection-cycling adds latency that is fine for
+streaming (buffered) but too much for a live call. Recommendation: **split-tunnel**
+call apps (send them straight out, not through the VPN); route everything else
+through cyclevpn.
+
 ## How it works internally
 
 * **relay** (exit): holds the live TCP connection to each destination. Buffers the
@@ -138,3 +182,19 @@ throughput until the box’s CPU (TLS handshakes) or a connection‑rate limit c
   the entry inbound.
 
 Not affiliated with any provider. Use responsibly and legally.
+
+## Tuning (all flags)
+
+Every knob is a flag so you can sweep for your box/route:
+
+**client:** `-workers` (download prefetch window per stream), `-pool` (pre-warmed
+connections), `-maxconns` (global connection cap), `-chunk` (bytes/request, keep
+< ~16 KB), `-fetch-timeout` / `-poll-timeout` / `-ctrl-timeout`.
+**relay:** `-chunk`, `-hold` (long-poll wait).
+
+**Important — more is NOT always better.** Opening connections *too* aggressively
+(very large `-workers`/`-pool` sustained) can make the firewall **escalate** its
+throttling and clamp the whole box, collapsing throughput. Sweep upward and back
+off once you see it degrade. A moderate config (e.g. `-workers 32 -pool 64
+-maxconns 96`) is a good starting point; push it up only as far as your route
+tolerates. The client uses only ~15–30 MB RAM even with a large pool.
